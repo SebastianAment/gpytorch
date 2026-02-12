@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations
-
 import functools
 import string
 import warnings
@@ -310,17 +308,45 @@ class DefaultPredictionStrategy:
     def train_shape(self):
         return self._train_shape
 
-    def exact_prediction(self, joint_mean, joint_covar):
-        # Find the components of the distribution that contain test data
-        test_mean = joint_mean[..., self.num_train :]
-        # For efficiency - we can make things more efficient
-        if joint_covar.size(-1) <= settings.max_eager_kernel_size.value():
-            test_covar = joint_covar[..., self.num_train :, :].to_dense()
-            test_test_covar = test_covar[..., self.num_train :]
-            test_train_covar = test_covar[..., : self.num_train]
-        else:
-            test_test_covar = joint_covar[..., self.num_train :, self.num_train :]
-            test_train_covar = joint_covar[..., self.num_train :, : self.num_train]
+    def exact_prediction(
+        self,
+        test_mean: Tensor | LinearOperator,
+        test_test_covar: Tensor | LinearOperator,
+        test_train_covar: Tensor | LinearOperator,
+    ) -> tuple[Tensor, Tensor | LinearOperator]:
+        """
+        Computes the exact posterior distribution of the GP evaluated at test points.
+
+        This method computes the posterior predictive mean and covariance using the
+        standard GP conditioning formula.
+
+        Note on batch dimensions: The test covariances (test_test_covar, test_train_covar)
+        may have additional leading batch dimensions beyond the model's batch_shape.
+        For example, additive models may pass covariances with shape
+        (num_components, *batch_shape, n, n) to enable inference of individual additive
+        components. The method will handle broadcasting appropriately.
+
+        Note on masking: If observations contain NaN values that require masking, the
+        masking should be applied to test_train_covar before calling this method.
+        Override `_get_test_prior_mean_and_covariances` in your model to handle masking.
+
+        :param test_mean: The test prior mean (shape: ... x num_test)
+        :param test_test_covar: Covariance matrix between test inputs
+            (shape: extra_batch x ... x num_test x num_test)
+        :param test_train_covar: Covariance matrix between test and train inputs
+            (shape: extra_batch x ... x num_test x num_train)
+        :return: A tuple (posterior_predictive_mean, posterior_predictive_covar), with shapes
+            (extra_batch x ... x num_test), and (extra_batch x ... x num_test x num_test)
+        """
+        # sum(test_train_covar.shape[-2:]) = joint_covar.size(-1)
+        if sum(test_train_covar.shape[-2:]) <= settings.max_eager_kernel_size.value():
+            # If we are calling it here, it requires two calls to "to_dense", but if we
+            # called it in the test covariance getter, then it would break the other
+            # prediction strategies (actually it already, does because we are not
+            # overwriting them), which do not have a graceful fallback when the
+            # covariances are dense tensors.
+            test_train_covar = test_train_covar.to_dense()
+            test_test_covar = test_test_covar.to_dense()
 
         return (
             self.exact_predictive_mean(test_mean, test_train_covar),
@@ -329,11 +355,15 @@ class DefaultPredictionStrategy:
 
     def exact_predictive_mean(self, test_mean: Tensor, test_train_covar: LinearOperator) -> Tensor:
         """
-        Computes the posterior predictive covariance of a GP
+        Computes the posterior predictive mean of a GP.
+
+        Note: If observations contain NaN values that require masking, the masking
+        should be applied to test_train_covar before calling this method. Override
+        `_get_test_prior_mean_and_covariances` in your model to handle masking.
 
         :param Tensor test_mean: The test prior mean
         :param ~linear_operator.operators.LinearOperator test_train_covar:
-            Covariance matrix between test and train inputs
+            Covariance matrix between test and train inputs (pre-masked if needed)
         :return: The predictive posterior mean of the test points
         """
         # NOTE TO FUTURE SELF:
@@ -345,26 +375,11 @@ class DefaultPredictionStrategy:
         if len(mean_cache.shape) == 4:
             mean_cache = mean_cache.squeeze(1)
 
-        # Handle NaNs
-        nan_policy = settings.observation_nan_policy.value()
-        if nan_policy == "ignore":
-            res = (test_train_covar @ mean_cache.unsqueeze(-1)).squeeze(-1)
-        elif nan_policy == "mask":
-            # Restrict train dimension to observed values
-            observed = settings.observation_nan_policy._get_observed(mean_cache, torch.Size((mean_cache.shape[-1],)))
-            full_mask = torch.ones(test_mean.shape[-1], dtype=torch.bool, device=test_mean.device)
-            test_train_covar = MaskedLinearOperator(
-                to_linear_operator(test_train_covar), full_mask, observed.reshape(-1)
-            )
-            res = (test_train_covar @ mean_cache[..., observed].unsqueeze(-1)).squeeze(-1)
-        else:  # 'fill'
-            # Set the columns corresponding to missing observations to 0 to ignore them during matmul.
-            mask = (~torch.isnan(mean_cache)).to(torch.float)[..., None, :]
-            test_train_covar = test_train_covar * mask
-            mean = settings.observation_nan_policy._fill_tensor(mean_cache)
-            res = (test_train_covar @ mean.unsqueeze(-1)).squeeze(-1)
-        res = res + test_mean
-
+        # Replace NaN values with 0 for the matrix multiplication.
+        # NaN values in mean_cache correspond to masked/missing observations that
+        # should not contribute to the predictive mean.
+        mean_cache = torch.nan_to_num(mean_cache, nan=0.0)
+        res = (test_train_covar @ mean_cache.unsqueeze(-1)).squeeze(-1) + test_mean
         return res
 
     def exact_predictive_covar(
@@ -388,13 +403,13 @@ class DefaultPredictionStrategy:
             dist = self.train_prior_dist.__class__(
                 torch.zeros_like(self.train_prior_dist.mean), self.train_prior_dist.lazy_covariance_matrix
             )
+            train_train_covar = self.likelihood(dist, self.train_inputs).lazy_covariance_matrix
             if settings.detach_test_caches.on():
-                train_train_covar = self.likelihood(dist, self.train_inputs).lazy_covariance_matrix.detach()
-            else:
-                train_train_covar = self.likelihood(dist, self.train_inputs).lazy_covariance_matrix
+                train_train_covar = train_train_covar.detach()
 
             test_train_covar = to_dense(test_train_covar)
             train_test_covar = test_train_covar.transpose(-1, -2)
+            # This could be using just a single cholesky solve, for dense inference (currently two)
             covar_correction_rhs = train_train_covar.solve(train_test_covar)
             # For efficiency
             if torch.is_tensor(test_test_covar):
@@ -429,12 +444,6 @@ class InterpolatedPredictionStrategy(DefaultPredictionStrategy):
             train_prior_dist.mean, train_prior_dist.lazy_covariance_matrix.evaluate_kernel()
         )
         super().__init__(train_inputs, train_prior_dist, train_labels, likelihood)
-        # covar = self.train_prior_dist.lazy_covariance_matrix.evaluate_kernel()
-        # if isinstance(covar, LazyEvaluatedKernelTensor):
-        #     covar = covar.evaluate_kernel()
-        # self.train_prior_dist = self.train_prior_dist.__class__(
-        #     self.train_prior_dist.mean, covar
-        # )
         self.uses_wiski = uses_wiski
 
     def _exact_predictive_covar_inv_quad_form_cache(self, train_train_covar_inv_root, test_train_covar):
@@ -681,12 +690,14 @@ class InterpolatedPredictionStrategy(DefaultPredictionStrategy):
 
         return covar_cache
 
-    def exact_prediction(self, joint_mean, joint_covar):
-        # Find the components of the distribution that contain test data
-        test_mean = joint_mean[..., self.num_train :]
-        test_test_covar = joint_covar[..., self.num_train :, self.num_train :].evaluate_kernel()
-        test_train_covar = joint_covar[..., self.num_train :, : self.num_train].evaluate_kernel()
-
+    def exact_prediction(
+        self,
+        test_mean: Tensor | LinearOperator,
+        test_test_covar: Tensor | LinearOperator,
+        test_train_covar: Tensor | LinearOperator,
+    ):
+        # making sure not to call to_dense(), as the default strategy does if matrices
+        # are small, to preserve the linear algebraic structure
         return (
             self.exact_predictive_mean(test_mean, test_train_covar),
             self.exact_predictive_covar(test_test_covar, test_train_covar),
@@ -741,20 +752,38 @@ class LinearPredictionStrategy(DefaultPredictionStrategy):
         )
         super().__init__(train_inputs, train_prior_dist, train_labels, likelihood)
 
-    def exact_prediction(self, joint_mean: Tensor, joint_covar: LinearOperator) -> tuple[Tensor, LinearOperator]:
+    def exact_prediction(
+        self,
+        test_mean: Tensor | LinearOperator,
+        test_test_covar: Tensor | LinearOperator,
+        test_train_covar: Tensor | LinearOperator,
+    ) -> tuple[Tensor, LinearOperator]:
         """
         Computes the exact moments of the posterior distribution of the GP
-        evaluated on the test poioiints.
+        evaluated on the test points.
 
-        :param joint_mean: The joint prior mean of train and test points (shape: ... x (num_train + num_test))
-        :param joint_covar: The joint prior covariance of train and test points
-            (shape: ... x (num_train + num_test) x (num_train + num_test))
+        For low-rank kernels (e.g., LinearKernel, RFFKernel), the test_train_covar
+        is not used because the test features can be extracted from test_test_covar.root
+        and the training features are already baked into the mean_cache. This is an
+        efficiency optimization using the Searle identity to work in d-dimensional
+        feature space rather than n-dimensional data space.
+
+        :param test_mean: The test prior mean (shape: ... x num_test)
+        :param test_test_covar: Covariance matrix between test inputs
+            (shape: ... x num_test x num_test)
+        :param test_train_covar: Covariance matrix between test and train inputs
+            (shape: ... x num_test x num_train). Not used for low-rank kernels.
         :return: A tuple (posterior_predictive_mean, posterior_predictive_covar), with shapes
             (... x num_test), and (... x num_test x num_test) respectively.
         """
-        # Find the components of the distribution that contain test data
-        test_mean = joint_mean[..., self.num_train :]
-        test_test_covar = joint_covar[..., self.num_train :, self.num_train :].evaluate_kernel()
+        # NOTE: test_train_covar is intentionally not used for low-rank kernels.
+        # The test features phi(x*) are extracted from test_test_covar.root, and
+        # the training features are already baked into mean_cache = Phi^T (Phi Phi^T + D)^{-1} (y - mu).
+        # Therefore: posterior_mean = phi(x*) @ mean_cache = K(x*, X) (K(X,X) + D)^{-1} (y - mu)
+
+        # Evaluate kernel if needed
+        if hasattr(test_test_covar, "evaluate_kernel"):
+            test_test_covar = test_test_covar.evaluate_kernel()
 
         # Get rid of any constant multipliers
         if isinstance(test_test_covar, ConstantMulLinearOperator):
@@ -763,13 +792,31 @@ class LinearPredictionStrategy(DefaultPredictionStrategy):
         else:
             constant = torch.tensor(1.0, dtype=test_test_covar.dtype, device=test_test_covar.device)
 
+        # Extract features phi(x*) from the test_test_covar.
+        # For low-rank kernels, test_test_covar = phi(x*) @ phi(x*)^T.
+        #
+        # The covariance may have different structures depending on how it was obtained:
+        # 1. Direct kernel call: RootLinearOperator with .root = phi(x*)
+        # 2. Sliced from joint with equal indices: RootLinearOperator with .root = phi(x*)
+        # 3. Sliced from joint with different indices (shouldn't happen for test_test_covar)
+        #    but handle MatmulLinearOperator(left, right.mT) where left = phi(x*)
+        #
+        # If we can't extract the feature matrix, fall back to DefaultPredictionStrategy.
+        if hasattr(test_test_covar, "root"):
+            # Cases 1 & 2: RootLinearOperator or LowRankRootLinearOperator
+            features = test_test_covar.root.to_dense() * constant.sqrt()
+        elif isinstance(test_test_covar, MatmulLinearOperator):
+            # Case 3: When slicing creates MatmulLinearOperator(left, right.mT),
+            # the left factor is the sliced root phi(x*)
+            features = test_test_covar.left_linear_op.to_dense() * constant.sqrt()
+        else:
+            # Fall back to default prediction strategy if we can't extract features
+            return super().exact_prediction(test_mean, test_test_covar, test_train_covar)
+
         # Get cached computations of the expensive components of the posterior
         mean_cache, covar_cache = self.mean_covar_cache
         # mean_cache: X^T (X X^T + D)^{-1} y, ... x num_features x 1
         # covar_cache: chol( (I - X^T (X X^T + D)^{-1} X)^{-1} ), ... x num_features x num_features
-
-        # Compute the linear model posterior
-        features = test_test_covar.root.to_dense() * constant.sqrt()
         posterior_predictive_mean = (features @ mean_cache).squeeze(-1) + test_mean
         posterior_predictive_covar = RootLinearOperator(
             torch.linalg.solve_triangular(covar_cache, features.mT, upper=False).mT
@@ -920,14 +967,15 @@ class SGPRPredictionStrategy(DefaultPredictionStrategy):
             "Fantasy observation updates not yet supported for models using SGPRPredictionStrategy"
         )
 
-    def exact_prediction(self, joint_mean, joint_covar):
+    def exact_prediction(
+        self,
+        test_mean: Tensor | LinearOperator,
+        test_test_covar: Tensor | LinearOperator,
+        test_train_covar: Tensor | LinearOperator,
+    ) -> tuple[Tensor, Tensor | LinearOperator]:
         from ..kernels.inducing_point_kernel import InducingPointKernel
 
-        # Find the components of the distribution that contain test data
-        test_mean = joint_mean[..., self.num_train :]
-
         # If we're in lazy evaluation mode, let's use the base kernel of the SGPR output to compute the prior covar
-        test_test_covar = joint_covar[..., self.num_train :, self.num_train :]
         if isinstance(test_test_covar, LazyEvaluatedKernelTensor) and isinstance(
             test_test_covar.kernel, InducingPointKernel
         ):
@@ -938,8 +986,6 @@ class SGPRPredictionStrategy(DefaultPredictionStrategy):
                 test_test_covar.last_dim_is_batch,
                 **test_test_covar.params,
             )
-
-        test_train_covar = joint_covar[..., self.num_train :, : self.num_train].evaluate_kernel()
 
         return (
             self.exact_predictive_mean(test_mean, test_train_covar),
